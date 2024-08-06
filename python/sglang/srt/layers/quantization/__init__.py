@@ -27,7 +27,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 )
 from vllm.model_executor.layers.quantization.deepspeedfp import DeepSpeedFPConfig
 from vllm.model_executor.layers.quantization.gptq import GPTQConfig
-from vllm.model_executor.layers.quantization.gptq_marlin import GPTQMarlinConfig
+from sglang.srt.layers.quantization_marlin.gptq_marlin import GPTQMarlinConfig
 from vllm.model_executor.layers.quantization.gptq_marlin_24 import GPTQMarlin24Config
 from vllm.model_executor.layers.quantization.marlin import MarlinConfig
 from vllm.model_executor.layers.quantization.squeezellm import SqueezeLLMConfig
