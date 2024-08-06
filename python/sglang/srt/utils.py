@@ -454,6 +454,11 @@ def monkey_patch_vllm_dummy_weight_loader():
 
     setattr(DummyModelLoader, "load_model", load_model)
 
+def monkey_patch_vllm_gptq_marlin_quant_method():
+    from sglang.srt.layers.quantization.gptq_marlin import GPTQMarlinConfig
+    from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
+
+    QUANTIZATION_METHODS["gptq_marlin"] = GPTQMarlinConfig
 
 vllm_all_gather_backup = None
 

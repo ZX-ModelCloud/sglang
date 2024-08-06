@@ -54,6 +54,7 @@ from sglang.srt.utils import (
     is_llama3_405b_fp8,
     is_multimodal_model,
     monkey_patch_vllm_dummy_weight_loader,
+    monkey_patch_vllm_gptq_marlin_quant_method,
     monkey_patch_vllm_p2p_access_check,
     monkey_patch_vllm_qvk_linear_loader,
 )
@@ -140,6 +141,7 @@ class ModelRunner:
         )
 
         monkey_patch_vllm_dummy_weight_loader()
+        monkey_patch_vllm_gptq_marlin_quant_method()
         device_config = DeviceConfig()
         load_config = LoadConfig(load_format=self.server_args.load_format)
         vllm_model_config = VllmModelConfig(
