@@ -95,9 +95,17 @@ class _ModelRegistry:
 def import_model_classes(package_name: str, strict: bool = False):
     model_arch_name_to_cls = {}
     package = importlib.import_module(package_name)
+    allowlist = envs.SGLANG_MODEL_REGISTRY_ALLOWLIST.get()
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
         if not ispkg:
-            if name.split(".")[-1] in envs.SGLANG_DISABLED_MODEL_ARCHS.get():
+            module_name = name.split(".")[-1]
+            if allowlist and module_name not in allowlist:
+                logger.debug(
+                    f"Skip loading {name} due to SGLANG_MODEL_REGISTRY_ALLOWLIST"
+                )
+                continue
+
+            if module_name in envs.SGLANG_DISABLED_MODEL_ARCHS.get():
                 logger.debug(f"Skip loading {name} due to SGLANG_DISABLED_MODEL_ARCHS")
                 continue
 

@@ -20,6 +20,11 @@ def main():
         add_help=False,
     )
     subparsers.add_parser(
+        "serve-deepseek-v4",
+        help="Launch a DeepSeek-V4-only SGLang server.",
+        add_help=False,
+    )
+    subparsers.add_parser(
         "generate",
         help="Run inference on a multimodal model.",
         add_help=False,
@@ -38,6 +43,10 @@ def main():
         from sglang.cli.serve import serve
 
         serve(args, extra_argv)
+    elif args.subcommand == "serve-deepseek-v4":
+        from sglang.launch_deepseek_v4 import main as launch_deepseek_v4
+
+        launch_deepseek_v4(extra_argv)
     elif args.subcommand == "generate":
         from sglang.cli.generate import generate
 
