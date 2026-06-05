@@ -15,6 +15,9 @@ classifiers = [
 ]
 
 dependencies = [
+  "tilelang",
+  "compressed_tensors",
+  "gguf",
   "IPython",
   "openai",
   "einops",
