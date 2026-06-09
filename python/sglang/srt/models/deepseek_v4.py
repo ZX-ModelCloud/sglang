@@ -1858,16 +1858,16 @@ class DeepseekV4ForCausalLM(nn.Module):
         name = name.replace(".attn_norm.", ".input_layernorm.")
         name = name.replace(".ffn_norm.", ".post_attention_layernorm.")
 
-        if "self_attn" in name:
-            name = name.replace(".scale", ".weight_scale_inv")
+        # if "self_attn" in name:
+        #     name = name.replace(".scale", ".weight_scale_inv")
 
         name = name.replace(".gate.tid2eid", ".topk.tid2eid")
         name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
         name = name.replace(".w1.", ".gate_proj.")
         name = name.replace(".w2.", ".down_proj.")
         name = name.replace(".w3.", ".up_proj.")
-        if "mlp" in name:
-            name = name.replace(".scale", ".weight_scale_inv")
+        # if "mlp" in name:
+        #     name = name.replace(".scale", ".weight_scale_inv")
 
         return name
 
@@ -2011,9 +2011,13 @@ class DeepseekV4ForCausalLM(nn.Module):
                     for param_name, weight_name, shard_id in stacked_params_mapping:
                         if weight_name not in name:
                             continue
+                        # if weight_name not in name or ".mlp." not in name:
+                        #     continue
                         if _is_npu:
                             name = name.replace("weight_packed", "weight")
                         if ("mlp.experts." in name) and name not in params_dict:
+                            continue
+                        if ".self_attn.compressor." in name:
                             continue
                         name = name.replace(weight_name, param_name)
                         if name.endswith(".bias") and name not in params_dict:
