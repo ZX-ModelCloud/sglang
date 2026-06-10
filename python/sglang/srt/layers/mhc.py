@@ -24,6 +24,15 @@ FP32 = "float32"
 INT32 = "int32"
 
 
+def use_deepgemm_hc_prenorm() -> bool:
+    if not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+        return False
+
+    from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
+
+    return ENABLE_JIT_DEEPGEMM
+
+
 @tilelang.jit(pass_configs=pass_configs)
 def hc_split_sinkhorn_kernel(hc: int, sinkhorn_iters: int, eps: float):
     n = T.symbolic("n")
@@ -382,7 +391,7 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
                     out_frag,
                     transpose_A=False,
                     transpose_B=True,
-                    wg_wait=0,
+                    # wg_wait=0,
                     clear_accum=False,
                 )
 
@@ -671,7 +680,7 @@ def mhc_pre(
         num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
     )
 
-    if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+    if use_deepgemm_hc_prenorm():
         n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
 
         gemm_out_mul = torch.empty(
@@ -1283,10 +1292,12 @@ def mhc_fused_post_pre(
             hidden_size,
         )
 
-        if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
-            import deep_gemm
+        if use_deepgemm_hc_prenorm():
+            from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
+                tf32_hc_prenorm_gemm,
+            )
 
-            deep_gemm.tf32_hc_prenorm_gemm(
+            tf32_hc_prenorm_gemm(
                 residual_cur.view(num_tokens, hc_hidden_size),
                 fn,
                 gemm_out_mul,

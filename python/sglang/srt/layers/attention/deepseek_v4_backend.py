@@ -55,7 +55,11 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.utils import ceil_align
-from sglang.srt.utils.common import is_sm120_supported
+from sglang.srt.utils.common import (
+    is_blackwell_supported,
+    is_sm90_supported,
+    is_sm120_supported,
+)
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -64,6 +68,9 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 _is_sm120 = is_sm120_supported()
+_is_flashmla_kernel_supported = (
+    _is_sm120 or is_sm90_supported() or is_blackwell_supported()
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,11 +91,162 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
+    if not _is_flashmla_kernel_supported:
+        return None
     if _is_sm120:
         return None
     import sgl_kernel.flash_mla as flash_mla
 
     return flash_mla.get_mla_metadata()[0]
+
+
+def _decode_e4m3fn_to_fp32(raw: torch.Tensor) -> torch.Tensor:
+    raw_i = raw.to(torch.int16)
+    sign = torch.where((raw_i & 0x80) != 0, -1.0, 1.0)
+    exponent = (raw_i >> 3) & 0x0F
+    mantissa = raw_i & 0x07
+
+    normal = exponent != 0
+    normal_value = torch.ldexp(
+        1.0 + mantissa.to(torch.float32) * 0.125, exponent.to(torch.int32) - 7
+    )
+    subnormal_value = torch.ldexp(
+        mantissa.to(torch.float32) * 0.125,
+        torch.full_like(exponent, -6, dtype=torch.int32),
+    )
+    value = torch.where(normal, normal_value, subnormal_value)
+    return value * sign
+
+
+def _gather_dequant_dsv4_kv_cache(
+    kv_cache: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    block_size = kv_cache.shape[1]
+    safe_indices = torch.clamp(indices.to(torch.long), min=0)
+    block_idx = safe_indices // block_size
+    offset = safe_indices % block_size
+    packed = kv_cache[block_idx, offset, 0]
+
+    nope_raw = packed[..., :448]
+    rope_raw = packed[..., 448:576].contiguous()
+    scale_raw = packed[..., 576:583]
+
+    nope = _decode_e4m3fn_to_fp32(nope_raw).view(*nope_raw.shape[:-1], 7, 64)
+    scale = torch.exp2(scale_raw.to(torch.float32) - 127.0)
+    nope = (nope * scale.unsqueeze(-1)).flatten(-2)
+    rope = rope_raw.view(torch.bfloat16).to(torch.float32)
+    return torch.cat([nope, rope], dim=-1)
+
+
+def _flatten_topk_length(
+    topk_length: Optional[torch.Tensor],
+    batch_size: int,
+    seq_len: int,
+    total_tokens: int,
+) -> Optional[torch.Tensor]:
+    if topk_length is None:
+        return None
+    flat = topk_length.reshape(-1)
+    if flat.numel() == total_tokens:
+        return flat
+    if flat.numel() == batch_size:
+        return flat.repeat_interleave(seq_len)
+    raise ValueError(f"unexpected {topk_length.shape=} for {batch_size=} {seq_len=}")
+
+
+def _torch_fp8_sparse_attention_fwd(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    head_dim_v: int,
+    softmax_scale: float,
+    indices: torch.Tensor,
+    attn_sink: Optional[torch.Tensor],
+    topk_length: Optional[torch.Tensor],
+    extra_k_cache: Optional[torch.Tensor],
+    extra_indices: Optional[torch.Tensor],
+    extra_topk_length: Optional[torch.Tensor],
+    chunk_size: int = 16,
+) -> torch.Tensor:
+    batch_size, seq_len, num_heads, head_dim = q.shape
+    assert head_dim == 512
+    assert head_dim_v == 512
+    total_tokens = batch_size * seq_len
+
+    q_flat = q.reshape(total_tokens, num_heads, head_dim).to(torch.float32)
+    indices_flat = indices.reshape(total_tokens, -1)
+    topk_length_flat = _flatten_topk_length(
+        topk_length, batch_size, seq_len, total_tokens
+    )
+
+    if extra_indices is not None:
+        assert extra_k_cache is not None
+        extra_indices_flat = extra_indices.reshape(total_tokens, -1)
+        extra_topk_length_flat = _flatten_topk_length(
+            extra_topk_length, batch_size, seq_len, total_tokens
+        )
+    else:
+        extra_indices_flat = None
+        extra_topk_length_flat = None
+
+    output = torch.empty(
+        total_tokens, num_heads, head_dim_v, dtype=torch.float32, device=q.device
+    )
+    sink = attn_sink.to(torch.float32) if attn_sink is not None else None
+
+    for start in range(0, total_tokens, chunk_size):
+        end = min(start + chunk_size, total_tokens)
+        chunk_q = q_flat[start:end]
+        chunk_indices = indices_flat[start:end]
+        chunk_k = _gather_dequant_dsv4_kv_cache(k_cache, chunk_indices)
+        valid = chunk_indices >= 0
+        if topk_length_flat is not None:
+            offsets = torch.arange(chunk_indices.shape[1], device=q.device)
+            valid = valid & (offsets.unsqueeze(0) < topk_length_flat[start:end, None])
+
+        if extra_indices_flat is not None:
+            chunk_extra_indices = extra_indices_flat[start:end]
+            chunk_extra_k = _gather_dequant_dsv4_kv_cache(
+                extra_k_cache, chunk_extra_indices
+            )
+            extra_valid = chunk_extra_indices >= 0
+            if extra_topk_length_flat is not None:
+                extra_offsets = torch.arange(
+                    chunk_extra_indices.shape[1], device=q.device
+                )
+                extra_valid = extra_valid & (
+                    extra_offsets.unsqueeze(0)
+                    < extra_topk_length_flat[start:end, None]
+                )
+            chunk_k = torch.cat([chunk_k, chunk_extra_k], dim=1)
+            valid = torch.cat([valid, extra_valid], dim=1)
+
+        scores = torch.einsum("thd,tkd->thk", chunk_q, chunk_k) * softmax_scale
+        scores = scores.masked_fill(~valid[:, None, :], float("-inf"))
+
+        max_scores = scores.max(dim=-1).values
+        if sink is not None:
+            max_scores = torch.maximum(max_scores, sink.view(1, -1))
+        lonely = torch.isneginf(max_scores)
+        safe_max = torch.where(lonely, torch.zeros_like(max_scores), max_scores)
+
+        exp_scores = torch.exp(scores - safe_max[:, :, None]).masked_fill(
+            ~valid[:, None, :], 0.0
+        )
+        denom = exp_scores.sum(dim=-1)
+        if sink is not None:
+            denom = denom + torch.exp(sink.view(1, -1) - safe_max)
+
+        chunk_out = torch.einsum("thk,tkd->thd", exp_scores, chunk_k)
+        chunk_out = torch.where(
+            denom[:, :, None] > 0,
+            chunk_out / torch.clamp_min(denom[:, :, None], 1e-20),
+            torch.zeros_like(chunk_out),
+        )
+        chunk_out = torch.where(lonely[:, :, None], 0.0, chunk_out)
+        output[start:end] = chunk_out
+
+    return output.reshape(batch_size, seq_len, num_heads, head_dim_v).to(q.dtype)
 
 
 def _create_dummy_paged_compress_data(compress_ratio: int):
@@ -1044,7 +1202,7 @@ class DeepseekV4AttnBackend(
                     extra_indices_in_kvcache=extra_indices,
                     extra_topk_length=extra_topk_lengths,
                 )[0]
-            else:
+            elif _is_flashmla_kernel_supported:
                 import sgl_kernel.flash_mla as flash_mla
 
                 o = flash_mla.flash_mla_with_kvcache(
@@ -1063,6 +1221,19 @@ class DeepseekV4AttnBackend(
                     extra_indices_in_kvcache=extra_indices,
                     extra_topk_length=extra_topk_lengths,
                 )[0]
+            else:
+                o = _torch_fp8_sparse_attention_fwd(
+                    q=q,
+                    k_cache=swa_k_cache,
+                    head_dim_v=self.head_dim_v,
+                    softmax_scale=self.softmax_scale,
+                    indices=swa_page_indices,
+                    attn_sink=attn_sink,
+                    topk_length=swa_topk_lengths,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                )
 
             o = o.squeeze(1)
             return o
