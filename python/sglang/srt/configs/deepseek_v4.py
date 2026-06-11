@@ -36,7 +36,7 @@ def try_detect_fp4_experts(model_path: str) -> Optional[bool]:
         return None
     if dtype in ("U8", "I8", "F4"):
         return True
-    if dtype == "F8_E4M3":
+    if dtype in ("F8_E4M3", "I32"):
         return False
     logger.warning(
         "Unexpected routed-expert safetensors dtype=%s for DeepSeek V4", dtype

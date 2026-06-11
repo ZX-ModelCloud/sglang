@@ -636,7 +636,7 @@ class C4Indexer(nn.Module):
             self.q_lora_rank,
             self.n_heads * self.head_dim,
             bias=False,
-            quant_config=quant_config,
+            quant_config=None,
             params_dtype=torch.bfloat16,
             prefix=add_prefix("wq_b", prefix),
         )

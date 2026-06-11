@@ -359,6 +359,29 @@ def marlin_moe_permute_scales(
     return output
 
 
+def marlin_narrow_full_w2_group_metadata_for_moe_tp(
+    tensor: torch.Tensor,
+    *,
+    group_size: int,
+    intermediate_size_per_partition: int,
+    moe_tp_size: int,
+    moe_tp_rank: int,
+) -> torch.Tensor:
+    if group_size == -1 or moe_tp_size == 1:
+        return tensor
+
+    local_groups = intermediate_size_per_partition // group_size
+    if local_groups == 0:
+        return tensor
+
+    full_groups = local_groups * moe_tp_size
+    if tensor.shape[1] != full_groups:
+        return tensor
+
+    start = local_groups * moe_tp_rank
+    return tensor.narrow(1, start, local_groups).contiguous()
+
+
 def marlin_zero_points(
     zp: torch.Tensor, size_k: int, size_n: int, num_bits: int
 ) -> torch.Tensor:
