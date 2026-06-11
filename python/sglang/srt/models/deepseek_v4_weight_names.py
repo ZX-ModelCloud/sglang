@@ -34,6 +34,17 @@ def get_fused_wqkv_a_weight_info(
 
 def remap_transformers_weight_name_to_sglang_format(name: str) -> str:
     """Map transformers DeepSeek-V4 weight keys to sglang module names."""
+    indexer_name_mapping = {
+        ".self_attn.compressor.indexer.q_b_proj.": ".self_attn.indexer.wq_b.",
+        ".self_attn.compressor.indexer.weights_proj.": ".self_attn.indexer.weights_proj.",
+        ".self_attn.compressor.indexer.kv_proj.": ".self_attn.indexer.compressor.wkv.",
+        ".self_attn.compressor.indexer.gate_proj.": ".self_attn.indexer.compressor.wgate.",
+        ".self_attn.compressor.indexer.kv_norm.": ".self_attn.indexer.compressor.norm.",
+        ".self_attn.compressor.indexer.position_bias": ".self_attn.indexer.compressor.ape",
+    }
+    for transformers_name, sglang_name in indexer_name_mapping.items():
+        name = name.replace(transformers_name, sglang_name)
+
     attn_name_mapping = {
         ".self_attn.q_a_proj.": ".self_attn.wq_a.",
         ".self_attn.q_b_proj.": ".self_attn.wq_b.",
