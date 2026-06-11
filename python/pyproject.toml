@@ -15,6 +15,8 @@ classifiers = [
 ]
 
 dependencies = [
+  "openai_harmony",
+  "xgrammar",
   "tilelang",
   "compressed_tensors",
   "gguf",
