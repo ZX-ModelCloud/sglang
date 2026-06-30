@@ -66,6 +66,8 @@ def fp8_paged_mqa_logits_torch(
     assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
     assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
     assert weight.shape == (batch_size, num_heads)
+    if seq_lens.dim() > 1:
+        seq_lens = seq_lens.squeeze(-1)
     assert seq_lens.shape == (batch_size,)
     assert page_table.shape[0] == batch_size
     assert clean_logits == False
@@ -511,7 +513,9 @@ class C4IndexerBackendMixin:
             )
         elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
             fn = _aiter_fp8_paged_mqa_logits
-        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or (
+            q.is_cuda and torch.cuda.get_device_capability(q.device)[0] < 9
+        ):
             if is_sm120_supported():
                 fn = fp8_paged_mqa_logits_torch_sm120
             else:
