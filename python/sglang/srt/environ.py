@@ -204,6 +204,8 @@ class Envs:
     #        group at offset (r * k), improving multi-rank I/O concurrency while
     #        keeping access relatively ordered.
     SGLANG_SORT_WEIGHT_FILES = EnvInt(0)
+    SGLANG_DEEPSEEK_V4_ONLY = EnvBool(False)
+    SGLANG_MODEL_REGISTRY_ALLOWLIST = EnvTuple(tuple())
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)

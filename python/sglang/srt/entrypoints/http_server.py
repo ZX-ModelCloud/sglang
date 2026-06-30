@@ -40,6 +40,12 @@ from typing import (
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
+_DEEPSEEK_V4_ONLY = os.getenv("SGLANG_DEEPSEEK_V4_ONLY", "").lower() in (
+    "1",
+    "true",
+    "yes",
+    "y",
+)
 
 import numpy as np
 import requests
@@ -62,48 +68,25 @@ from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
-from sglang.srt.entrypoints.anthropic.protocol import (
-    AnthropicCountTokensRequest,
-    AnthropicMessagesRequest,
-)
-from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
 from sglang.srt.entrypoints.engine import (
     Engine,
     init_tokenizer_manager,
     run_detokenizer_process,
     run_scheduler_process,
 )
-from sglang.srt.entrypoints.ollama.protocol import (
-    OllamaChatRequest,
-    OllamaGenerateRequest,
-    OllamaShowRequest,
-)
-from sglang.srt.entrypoints.ollama.serving import OllamaServing
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
-    ClassifyRequest,
     CompletionRequest,
     DetokenizeRequest,
-    EmbeddingRequest,
     ErrorResponse,
     ModelCard,
     ModelList,
-    ResponsesRequest,
-    ScoringRequest,
     TokenizeRequest,
-    V1RerankReqInput,
 )
-from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
-from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
-from sglang.srt.entrypoints.openai.serving_rerank import OpenAIServingRerank
-from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
 from sglang.srt.entrypoints.openai.serving_tokenize import (
     OpenAIServingDetokenize,
     OpenAIServingTokenize,
-)
-from sglang.srt.entrypoints.openai.serving_transcription import (
-    OpenAIServingTranscription,
 )
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
@@ -177,6 +160,33 @@ from sglang.srt.utils.json_response import (
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
+
+if not _DEEPSEEK_V4_ONLY:
+    from sglang.srt.entrypoints.anthropic.protocol import (
+        AnthropicCountTokensRequest,
+        AnthropicMessagesRequest,
+    )
+    from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
+    from sglang.srt.entrypoints.ollama.protocol import (
+        OllamaChatRequest,
+        OllamaGenerateRequest,
+        OllamaShowRequest,
+    )
+    from sglang.srt.entrypoints.ollama.serving import OllamaServing
+    from sglang.srt.entrypoints.openai.protocol import (
+        ClassifyRequest,
+        EmbeddingRequest,
+        ResponsesRequest,
+        ScoringRequest,
+        V1RerankReqInput,
+    )
+    from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
+    from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
+    from sglang.srt.entrypoints.openai.serving_rerank import OpenAIServingRerank
+    from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
+    from sglang.srt.entrypoints.openai.serving_transcription import (
+        OpenAIServingTranscription,
+    )
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -322,39 +332,45 @@ async def lifespan(fast_api_app: FastAPI):
             _global_state.tokenizer_manager, _global_state.template_manager
         )
     )
-    fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
-        _global_state.tokenizer_manager, _global_state.template_manager
-    )
-    fast_api_app.state.openai_serving_classify = OpenAIServingClassify(
-        _global_state.tokenizer_manager, _global_state.template_manager
-    )
-    fast_api_app.state.openai_serving_score = OpenAIServingScore(
-        _global_state.tokenizer_manager
-    )
-    fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
-        _global_state.tokenizer_manager, _global_state.template_manager
-    )
     fast_api_app.state.openai_serving_tokenize = OpenAIServingTokenize(
         _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_detokenize = OpenAIServingDetokenize(
         _global_state.tokenizer_manager
     )
-    fast_api_app.state.openai_serving_transcription = OpenAIServingTranscription(
-        _global_state.tokenizer_manager
-    )
 
-    # Initialize Ollama-compatible serving handler
-    fast_api_app.state.ollama_serving = OllamaServing(_global_state.tokenizer_manager)
+    if not _DEEPSEEK_V4_ONLY:
+        fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
+            _global_state.tokenizer_manager, _global_state.template_manager
+        )
+        fast_api_app.state.openai_serving_classify = OpenAIServingClassify(
+            _global_state.tokenizer_manager, _global_state.template_manager
+        )
+        fast_api_app.state.openai_serving_score = OpenAIServingScore(
+            _global_state.tokenizer_manager
+        )
+        fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
+            _global_state.tokenizer_manager, _global_state.template_manager
+        )
+        fast_api_app.state.openai_serving_transcription = OpenAIServingTranscription(
+            _global_state.tokenizer_manager
+        )
 
-    # Initialize Anthropic-compatible serving handler
-    fast_api_app.state.anthropic_serving = AnthropicServing(
-        fast_api_app.state.openai_serving_chat
-    )
+        # Initialize Ollama-compatible serving handler
+        fast_api_app.state.ollama_serving = OllamaServing(
+            _global_state.tokenizer_manager
+        )
+
+        # Initialize Anthropic-compatible serving handler
+        fast_api_app.state.anthropic_serving = AnthropicServing(
+            fast_api_app.state.openai_serving_chat
+        )
 
     # Launch tool server
     tool_server = None
-    if server_args.tool_server == "demo":
+    if _DEEPSEEK_V4_ONLY and server_args.tool_server:
+        logger.warning("Ignoring tool server in DeepSeek-V4-only mode.")
+    elif server_args.tool_server == "demo":
         from sglang.srt.entrypoints.openai.tool_server import DemoToolServer
 
         tool_server = DemoToolServer()
@@ -364,20 +380,23 @@ async def lifespan(fast_api_app: FastAPI):
         tool_server = MCPToolServer()
         await tool_server.add_tool_server(server_args.tool_server)
 
-    try:
-        from sglang.srt.entrypoints.openai.serving_responses import (
-            OpenAIServingResponses,
-        )
+    if not _DEEPSEEK_V4_ONLY:
+        try:
+            from sglang.srt.entrypoints.openai.serving_responses import (
+                OpenAIServingResponses,
+            )
 
-        fast_api_app.state.openai_serving_responses = OpenAIServingResponses(
-            _global_state.tokenizer_manager,
-            _global_state.template_manager,
-            enable_prompt_tokens_details=True,
-            tool_server=tool_server,
-        )
-    except Exception:
-        traceback = get_exception_traceback()
-        logger.warning(f"Can not initialize OpenAIServingResponses, error: {traceback}")
+            fast_api_app.state.openai_serving_responses = OpenAIServingResponses(
+                _global_state.tokenizer_manager,
+                _global_state.template_manager,
+                enable_prompt_tokens_details=True,
+                tool_server=tool_server,
+            )
+        except Exception:
+            traceback = get_exception_traceback()
+            logger.warning(
+                f"Can not initialize OpenAIServingResponses, error: {traceback}"
+            )
 
     # Execute custom warmups
     if server_args.warmups is not None:
@@ -743,28 +762,29 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             return _create_error_response(e)
 
 
-@app.api_route("/encode", methods=["POST", "PUT"])
-async def encode_request(obj: EmbeddingReqInput, request: Request):
-    """Handle an embedding request."""
-    try:
-        ret = await _global_state.tokenizer_manager.generate_request(
-            obj, request
-        ).__anext__()
-        return ret
-    except ValueError as e:
-        return _create_error_response(e)
+if not _DEEPSEEK_V4_ONLY:
 
+    @app.api_route("/encode", methods=["POST", "PUT"])
+    async def encode_request(obj: EmbeddingReqInput, request: Request):
+        """Handle an embedding request."""
+        try:
+            ret = await _global_state.tokenizer_manager.generate_request(
+                obj, request
+            ).__anext__()
+            return ret
+        except ValueError as e:
+            return _create_error_response(e)
 
-@app.api_route("/classify", methods=["POST", "PUT"])
-async def classify_request(obj: EmbeddingReqInput, request: Request):
-    """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
-    try:
-        ret = await _global_state.tokenizer_manager.generate_request(
-            obj, request
-        ).__anext__()
-        return ret
-    except ValueError as e:
-        return _create_error_response(e)
+    @app.api_route("/classify", methods=["POST", "PUT"])
+    async def classify_request(obj: EmbeddingReqInput, request: Request):
+        """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
+        try:
+            ret = await _global_state.tokenizer_manager.generate_request(
+                obj, request
+            ).__anext__()
+            return ret
+        except ValueError as e:
+            return _create_error_response(e)
 
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])
@@ -1513,28 +1533,29 @@ async def openai_v1_chat_completions(
     )
 
 
-@app.post(
-    "/v1/embeddings",
-    response_class=ORJSONResponse,
-    dependencies=[Depends(validate_json_request)],
-)
-async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
-    """OpenAI-compatible embeddings endpoint."""
-    return await raw_request.app.state.openai_serving_embedding.handle_request(
-        request, raw_request
-    )
+if not _DEEPSEEK_V4_ONLY:
 
-
-@app.post(
-    "/v1/classify",
-    response_class=ORJSONResponse,
-    dependencies=[Depends(validate_json_request)],
-)
-async def openai_v1_classify(request: ClassifyRequest, raw_request: Request):
-    """OpenAI-compatible classification endpoint."""
-    return await raw_request.app.state.openai_serving_classify.handle_request(
-        request, raw_request
+    @app.post(
+        "/v1/embeddings",
+        response_class=ORJSONResponse,
+        dependencies=[Depends(validate_json_request)],
     )
+    async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
+        """OpenAI-compatible embeddings endpoint."""
+        return await raw_request.app.state.openai_serving_embedding.handle_request(
+            request, raw_request
+        )
+
+    @app.post(
+        "/v1/classify",
+        response_class=ORJSONResponse,
+        dependencies=[Depends(validate_json_request)],
+    )
+    async def openai_v1_classify(request: ClassifyRequest, raw_request: Request):
+        """OpenAI-compatible classification endpoint."""
+        return await raw_request.app.state.openai_serving_classify.handle_request(
+            request, raw_request
+        )
 
 
 @app.post(
@@ -1573,34 +1594,35 @@ async def openai_v1_detokenize(request: DetokenizeRequest, raw_request: Request)
     )
 
 
-@app.post("/v1/audio/transcriptions")
-async def openai_v1_audio_transcriptions(
-    raw_request: Request,
-    file: UploadFile = File(...),
-    model: str = Form(default="default"),
-    language: Optional[str] = Form(default=None),
-    response_format: str = Form(default="json"),
-    temperature: float = Form(default=0.0),
-    stream: bool = Form(default=False),
-    timestamp_granularities: Optional[List[str]] = Form(
-        default=None, alias="timestamp_granularities[]"
-    ),
-):
-    """OpenAI-compatible audio transcription endpoint."""
-    if response_format not in ["json", "text", "verbose_json"]:
-        return ORJSONResponse(
-            content={
-                "error": {
-                    "message": "Only 'json', 'text', and 'verbose_json' formats supported"
-                }
-            },
-            status_code=400,
-        )
+if not _DEEPSEEK_V4_ONLY:
 
-    audio_data = await file.read()
+    @app.post("/v1/audio/transcriptions")
+    async def openai_v1_audio_transcriptions(
+        raw_request: Request,
+        file: UploadFile = File(...),
+        model: str = Form(default="default"),
+        language: Optional[str] = Form(default=None),
+        response_format: str = Form(default="json"),
+        temperature: float = Form(default=0.0),
+        stream: bool = Form(default=False),
+        timestamp_granularities: Optional[List[str]] = Form(
+            default=None, alias="timestamp_granularities[]"
+        ),
+    ):
+        """OpenAI-compatible audio transcription endpoint."""
+        if response_format not in ["json", "text", "verbose_json"]:
+            return ORJSONResponse(
+                content={
+                    "error": {
+                        "message": "Only 'json', 'text', and 'verbose_json' formats supported"
+                    }
+                },
+                status_code=400,
+            )
 
-    return (
-        await raw_request.app.state.openai_serving_transcription.create_transcription(
+        audio_data = await file.read()
+
+        return await raw_request.app.state.openai_serving_transcription.create_transcription(
             audio_data=audio_data,
             model=model,
             language=language,
@@ -1610,18 +1632,16 @@ async def openai_v1_audio_transcriptions(
             timestamp_granularities=timestamp_granularities,
             raw_request=raw_request,
         )
-    )
 
-
-@app.websocket("/v1/realtime")
-async def openai_v1_realtime_transcription(ws: WebSocket):
-    """OpenAI Realtime transcription WebSocket endpoint."""
-    # /v1/realtime is OpenAI's unified Realtime URL covering transcription +
-    # chat modes. This handler implements the transcription subset only;
-    # chat-mode session.update payloads are rejected by the
-    # `Literal["transcription"]` constraint on TranscriptionSessionConfig.type
-    # (see realtime/protocol.py).
-    await ws.app.state.openai_serving_transcription.handle_websocket(ws)
+    @app.websocket("/v1/realtime")
+    async def openai_v1_realtime_transcription(ws: WebSocket):
+        """OpenAI Realtime transcription WebSocket endpoint."""
+        # /v1/realtime is OpenAI's unified Realtime URL covering transcription +
+        # chat modes. This handler implements the transcription subset only;
+        # chat-mode session.update payloads are rejected by the
+        # `Literal["transcription"]` constraint on TranscriptionSessionConfig.type
+        # (see realtime/protocol.py).
+        await ws.app.state.openai_serving_transcription.handle_websocket(ws)
 
 
 @app.get("/v1/models", response_class=ORJSONResponse)
@@ -1681,58 +1701,58 @@ async def retrieve_model(model: str):
     )
 
 
-@app.post("/v1/score", dependencies=[Depends(validate_json_request)])
-async def v1_score_request(request: ScoringRequest, raw_request: Request):
-    """Endpoint for the scoring API. Supports CausalLM (logprob-based) and SequenceClassification (class logit-based) models. See Engine.score() for documentation."""
-    return await raw_request.app.state.openai_serving_score.handle_request(
-        request, raw_request
-    )
+if not _DEEPSEEK_V4_ONLY:
 
-
-@app.post("/v1/responses", dependencies=[Depends(validate_json_request)])
-async def v1_responses_request(request: dict, raw_request: Request):
-    """Endpoint for the responses API with reasoning support."""
-
-    request_obj = ResponsesRequest(**request)
-    result = await raw_request.app.state.openai_serving_responses.create_responses(
-        request_obj, raw_request
-    )
-
-    # Handle streaming responses
-    if isinstance(result, AsyncGenerator):
-        return StreamingResponse(
-            result,
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    @app.post("/v1/score", dependencies=[Depends(validate_json_request)])
+    async def v1_score_request(request: ScoringRequest, raw_request: Request):
+        """Endpoint for the scoring API. Supports CausalLM (logprob-based) and SequenceClassification (class logit-based) models. See Engine.score() for documentation."""
+        return await raw_request.app.state.openai_serving_score.handle_request(
+            request, raw_request
         )
 
-    return result
+    @app.post("/v1/responses", dependencies=[Depends(validate_json_request)])
+    async def v1_responses_request(request: dict, raw_request: Request):
+        """Endpoint for the responses API with reasoning support."""
 
+        request_obj = ResponsesRequest(**request)
+        result = await raw_request.app.state.openai_serving_responses.create_responses(
+            request_obj, raw_request
+        )
 
-@app.get("/v1/responses/{response_id}")
-async def v1_retrieve_responses(response_id: str, raw_request: Request):
-    """Retrieve a response by ID."""
-    return await raw_request.app.state.openai_serving_responses.retrieve_responses(
-        response_id
+        # Handle streaming responses
+        if isinstance(result, AsyncGenerator):
+            return StreamingResponse(
+                result,
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            )
+
+        return result
+
+    @app.get("/v1/responses/{response_id}")
+    async def v1_retrieve_responses(response_id: str, raw_request: Request):
+        """Retrieve a response by ID."""
+        return await raw_request.app.state.openai_serving_responses.retrieve_responses(
+            response_id
+        )
+
+    @app.post("/v1/responses/{response_id}/cancel")
+    async def v1_cancel_responses(response_id: str, raw_request: Request):
+        """Cancel a background response."""
+        return await raw_request.app.state.openai_serving_responses.cancel_responses(
+            response_id
+        )
+
+    @app.api_route(
+        "/v1/rerank",
+        methods=["POST", "PUT"],
+        dependencies=[Depends(validate_json_request)],
     )
-
-
-@app.post("/v1/responses/{response_id}/cancel")
-async def v1_cancel_responses(response_id: str, raw_request: Request):
-    """Cancel a background response."""
-    return await raw_request.app.state.openai_serving_responses.cancel_responses(
-        response_id
-    )
-
-
-@app.api_route(
-    "/v1/rerank", methods=["POST", "PUT"], dependencies=[Depends(validate_json_request)]
-)
-async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
-    """Endpoint for reranking documents based on query relevance."""
-    return await raw_request.app.state.openai_serving_rerank.handle_request(
-        request, raw_request
-    )
+    async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
+        """Endpoint for reranking documents based on query relevance."""
+        return await raw_request.app.state.openai_serving_rerank.handle_request(
+            request, raw_request
+        )
 
 
 ##### Ollama-compatible API endpoints #####
@@ -1755,53 +1775,53 @@ else:
         return "SGLang is running"
 
 
-@app.post(os.environ.get("SGLANG_OLLAMA_CHAT_ROUTE", "/api/chat"))
-async def ollama_chat(request: OllamaChatRequest, raw_request: Request):
-    """Ollama-compatible chat endpoint."""
-    return await raw_request.app.state.ollama_serving.handle_chat(request, raw_request)
+if not _DEEPSEEK_V4_ONLY:
 
+    @app.post(os.environ.get("SGLANG_OLLAMA_CHAT_ROUTE", "/api/chat"))
+    async def ollama_chat(request: OllamaChatRequest, raw_request: Request):
+        """Ollama-compatible chat endpoint."""
+        return await raw_request.app.state.ollama_serving.handle_chat(
+            request, raw_request
+        )
 
-@app.post(os.environ.get("SGLANG_OLLAMA_GENERATE_ROUTE", "/api/generate"))
-async def ollama_generate(request: OllamaGenerateRequest, raw_request: Request):
-    """Ollama-compatible generate endpoint."""
-    return await raw_request.app.state.ollama_serving.handle_generate(
-        request, raw_request
+    @app.post(os.environ.get("SGLANG_OLLAMA_GENERATE_ROUTE", "/api/generate"))
+    async def ollama_generate(request: OllamaGenerateRequest, raw_request: Request):
+        """Ollama-compatible generate endpoint."""
+        return await raw_request.app.state.ollama_serving.handle_generate(
+            request, raw_request
+        )
+
+    @app.get(os.environ.get("SGLANG_OLLAMA_TAGS_ROUTE", "/api/tags"))
+    async def ollama_tags(raw_request: Request):
+        """Ollama-compatible list models endpoint."""
+        return raw_request.app.state.ollama_serving.get_tags()
+
+    @app.post(os.environ.get("SGLANG_OLLAMA_SHOW_ROUTE", "/api/show"))
+    async def ollama_show(request: OllamaShowRequest, raw_request: Request):
+        """Ollama-compatible show model info endpoint."""
+        return raw_request.app.state.ollama_serving.get_show(request.model)
+
+    ##### Anthropic-compatible API endpoints #####
+
+    @app.post("/v1/messages", dependencies=[Depends(validate_json_request)])
+    async def anthropic_v1_messages(
+        request: AnthropicMessagesRequest, raw_request: Request
+    ):
+        """Anthropic-compatible Messages API endpoint."""
+        return await raw_request.app.state.anthropic_serving.handle_messages(
+            request, raw_request
+        )
+
+    @app.post(
+        "/v1/messages/count_tokens", dependencies=[Depends(validate_json_request)]
     )
-
-
-@app.get(os.environ.get("SGLANG_OLLAMA_TAGS_ROUTE", "/api/tags"))
-async def ollama_tags(raw_request: Request):
-    """Ollama-compatible list models endpoint."""
-    return raw_request.app.state.ollama_serving.get_tags()
-
-
-@app.post(os.environ.get("SGLANG_OLLAMA_SHOW_ROUTE", "/api/show"))
-async def ollama_show(request: OllamaShowRequest, raw_request: Request):
-    """Ollama-compatible show model info endpoint."""
-    return raw_request.app.state.ollama_serving.get_show(request.model)
-
-
-##### Anthropic-compatible API endpoints #####
-
-
-@app.post("/v1/messages", dependencies=[Depends(validate_json_request)])
-async def anthropic_v1_messages(
-    request: AnthropicMessagesRequest, raw_request: Request
-):
-    """Anthropic-compatible Messages API endpoint."""
-    return await raw_request.app.state.anthropic_serving.handle_messages(
-        request, raw_request
-    )
-
-
-@app.post("/v1/messages/count_tokens", dependencies=[Depends(validate_json_request)])
-async def anthropic_v1_count_tokens(
-    request: AnthropicCountTokensRequest, raw_request: Request
-):
-    """Anthropic-compatible token counting endpoint."""
-    return await raw_request.app.state.anthropic_serving.handle_count_tokens(
-        request, raw_request
-    )
+    async def anthropic_v1_count_tokens(
+        request: AnthropicCountTokensRequest, raw_request: Request
+    ):
+        """Anthropic-compatible token counting endpoint."""
+        return await raw_request.app.state.anthropic_serving.handle_count_tokens(
+            request, raw_request
+        )
 
 
 ## SageMaker API

@@ -97,6 +97,10 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     try_fused_hc_post_pre,
 )
 from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
+from sglang.srt.models.deepseek_v4_weight_names import (
+    get_fused_wqkv_a_weight_info,
+    remap_transformers_weight_name_to_sglang_format,
+)
 
 if not _is_hip:
     from sglang.srt.layers.utils.cp_utils import (
@@ -1191,7 +1195,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post.squeeze(-1), comb, False
 
-        if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+        from sglang.srt.layers.mhc import use_deepgemm_hc_prenorm
+
+        if use_deepgemm_hc_prenorm():
             from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
                 tf32_hc_prenorm_gemm,
             )
@@ -1811,6 +1817,16 @@ class DeepseekV4ForCausalLM(nn.Module):
             layer.refresh_mhc_norm_weight_cache()
 
     @staticmethod
+    def get_fused_wqkv_a_weight_info(
+        name: str,
+    ) -> Optional[Tuple[str, str, Optional[int]]]:
+        return get_fused_wqkv_a_weight_info(name)
+
+    @staticmethod
+    def remap_transformers_weight_name_to_sglang_format(name: str) -> str:
+        return remap_transformers_weight_name_to_sglang_format(name)
+
+    @staticmethod
     def remap_weight_name_to_dpsk_hf_format(
         name: str, is_nextn: bool = False, num_hidden_layers: Optional[int] = None
     ) -> str:
@@ -1858,16 +1874,20 @@ class DeepseekV4ForCausalLM(nn.Module):
         name = name.replace(".attn_norm.", ".input_layernorm.")
         name = name.replace(".ffn_norm.", ".post_attention_layernorm.")
 
-        if "self_attn" in name:
-            name = name.replace(".scale", ".weight_scale_inv")
+        # if "self_attn" in name:
+        #     name = name.replace(".scale", ".weight_scale_inv")
 
         name = name.replace(".gate.tid2eid", ".topk.tid2eid")
         name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
         name = name.replace(".w1.", ".gate_proj.")
         name = name.replace(".w2.", ".down_proj.")
         name = name.replace(".w3.", ".up_proj.")
-        if "mlp" in name:
-            name = name.replace(".scale", ".weight_scale_inv")
+        # if "mlp" in name:
+        #     name = name.replace(".scale", ".weight_scale_inv")
+
+        name = DeepseekV4ForCausalLM.remap_transformers_weight_name_to_sglang_format(
+            name
+        )
 
         return name
 
@@ -1917,7 +1937,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         COMPRESSOR_PART = ".compressor.w"
 
         fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
-        cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
+        cache_wqkv_a_weight: dict[
+            str, dict[str, Union[int, torch.Tensor, None]]
+        ] = {}
 
         def auto_weight_loader(module):
             return getattr(module, "weight_loader", default_weight_loader)
@@ -2011,9 +2033,13 @@ class DeepseekV4ForCausalLM(nn.Module):
                     for param_name, weight_name, shard_id in stacked_params_mapping:
                         if weight_name not in name:
                             continue
+                        # if weight_name not in name or ".mlp." not in name:
+                        #     continue
                         if _is_npu:
                             name = name.replace("weight_packed", "weight")
                         if ("mlp.experts." in name) and name not in params_dict:
+                            continue
+                        if ".self_attn.compressor." in name:
                             continue
                         name = name.replace(weight_name, param_name)
                         if name.endswith(".bias") and name not in params_dict:
@@ -2111,24 +2137,41 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     loaded_params.add(param_name)
                                     cache_compressor_weight.pop(key)
                             elif fuse_wqa_wkv and (
-                                name.endswith(".wq_a.weight")
-                                or name.endswith(".wq_a.weight_scale_inv")
-                                or name.endswith(".wkv.weight")
-                                or name.endswith(".wkv.weight_scale_inv")
-                            ):
-                                is_q = ".wq_a." in name
-                                param_name = name.replace(
-                                    ".wq_a." if is_q else ".wkv.", ".wqkv_a."
+                                wqkv_a_weight_info := self.get_fused_wqkv_a_weight_info(
+                                    name
                                 )
-                                bucket = cache_wqkv_a_weight.setdefault(param_name, {})
-                                shard_key = "q" if is_q else "kv"
-                                assert (
-                                    shard_key not in bucket
-                                ), f"duplicate shard {shard_key} for {param_name}"
+                            ):
+                                param_name, shard_key, cat_dim = wqkv_a_weight_info
+                                if cat_dim is None:
+                                    if param_name in loaded_params:
+                                        continue
+                                    param = params_dict[param_name]
+                                    weight_loader = auto_weight_loader(param)
+                                    maybe_executor_submit(
+                                        executor=executor,
+                                        futures=futures,
+                                        use_async=use_async_loading,
+                                        func=weight_loader,
+                                        func_args=(param, loaded_weight),
+                                    )
+                                    loaded_params.add(param_name)
+                                    continue
+
+                                bucket = cache_wqkv_a_weight.setdefault(
+                                    param_name, {"cat_dim": cat_dim}
+                                )
+                                assert bucket["cat_dim"] == cat_dim
+                                assert shard_key not in bucket, (
+                                    f"duplicate shard {shard_key} for {param_name}"
+                                )
                                 bucket[shard_key] = loaded_weight
-                                if len(bucket) == 2:
+                                if "q" in bucket and "kv" in bucket:
                                     fused_weight = torch.cat(
-                                        [bucket["q"], bucket["kv"]], dim=0
+                                        [
+                                            bucket["q"],
+                                            bucket["kv"],
+                                        ],
+                                        dim=cat_dim,
                                     )
                                     param = params_dict[param_name]
                                     weight_loader = auto_weight_loader(param)
@@ -2179,7 +2222,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
         unloaded_params = params_dict.keys() - loaded_params
 
-        skipped_checking_patterns = ["attn_mqa.k_scale", "attn_mqa.v_scale"]
+        skipped_checking_patterns = [
+            "attn_mqa.k_scale",
+            "attn_mqa.v_scale",
+            "g_idx_sort_indices",
+        ]
         if not self.pp_group.is_first_rank:
             skipped_checking_patterns.append("embed_tokens")
         if not self.pp_group.is_last_rank:

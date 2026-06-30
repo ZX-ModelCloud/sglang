@@ -2085,6 +2085,11 @@ class ServerArgs:
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
+            elif not (is_sm90_supported() or is_blackwell_supported()):
+                # SM80 does not support thread-block clusters required by topk_v2,
+                # and DeepGEMM is disabled by the wrapper on pre-Hopper GPUs.
+                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
 
         elif model_arch in ["GptOssForCausalLM"]:
             # Set attention backend for GPT-OSS

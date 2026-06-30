@@ -321,6 +321,7 @@ class DeepseekV2MLP(nn.Module):
         if (
             self.swiglu_limit is not None
             and not self.down_proj.reduce_results
+            and hasattr(self.down_proj, "weight")
             and self.down_proj.weight.dtype == torch.uint8
             and hasattr(self.down_proj, "weight_scale_inv")
         ):
@@ -735,6 +736,7 @@ class DeepseekV2MoE(nn.Module):
                 "awq",
                 "awq_marlin",
                 "moe_wna16",
+                "gptq_marlin"
             }
             self.shared_experts_is_int8 = (
                 not is_packed_weight

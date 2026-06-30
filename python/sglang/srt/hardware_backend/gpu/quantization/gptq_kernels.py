@@ -15,6 +15,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
     marlin_make_empty_g_idx,
     marlin_make_workspace,
     marlin_moe_permute_scales,
+    marlin_narrow_full_w2_group_metadata_for_moe_tp,
     marlin_permute_scales,
     marlin_sort_g_idx,
     marlin_zero_points,
@@ -341,15 +342,22 @@ class GPTQMarlinMoEKernel:
             group_size=self.quant_config.group_size,
         )
         replace_parameter(layer, "w13_scales", marlin_w13_scales)
+        w2_scales = marlin_narrow_full_w2_group_metadata_for_moe_tp(
+            layer.w2_scales,
+            group_size=self.quant_config.group_size,
+            intermediate_size_per_partition=layer.intermediate_size_per_partition,
+            moe_tp_size=layer.moe_tp_size,
+            moe_tp_rank=layer.moe_tp_rank,
+        )
         marlin_w2_scales = marlin_moe_permute_scales(
-            s=layer.w2_scales,
-            size_k=layer.w2_scales.shape[1]
+            s=w2_scales,
+            size_k=w2_scales.shape[1]
             * (
                 self.quant_config.group_size
                 if self.quant_config.group_size != -1
                 else self.quant_config.pack_factor
             ),
-            size_n=layer.w2_scales.shape[2],
+            size_n=w2_scales.shape[2],
             group_size=self.quant_config.group_size,
         )
         replace_parameter(layer, "w2_scales", marlin_w2_scales)
