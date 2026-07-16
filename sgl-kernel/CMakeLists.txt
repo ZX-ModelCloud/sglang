@@ -6,8 +6,13 @@ include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
 include(FetchContent)
 
 # CMake
-cmake_policy(SET CMP0169 OLD)
-cmake_policy(SET CMP0177 NEW)
+if(POLICY CMP0169)
+    cmake_policy(SET CMP0169 OLD)
+endif()
+if(POLICY CMP0177)
+    cmake_policy(SET CMP0177 NEW)
+endif()
+
 set(CMAKE_COLOR_DIAGNOSTICS ON)
 set(CMAKE_VERBOSE_MAKEFILE ON CACHE BOOL "ON")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -23,6 +28,10 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
 # CUDA
 enable_language(CUDA)
 find_package(CUDAToolkit REQUIRED)
+set(SGL_KERNEL_CUDA_INCLUDE_DIRS ${CUDAToolkit_INCLUDE_DIRS})
+if(EXISTS "${CUDAToolkit_INCLUDE_DIRS}/cccl")
+    list(APPEND SGL_KERNEL_CUDA_INCLUDE_DIRS "${CUDAToolkit_INCLUDE_DIRS}/cccl")
+endif()
 set_property(GLOBAL PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
 message(STATUS "Detected CUDA_VERSION=${CUDA_VERSION}")
@@ -326,6 +335,7 @@ set(INCLUDES
     ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
+    ${SGL_KERNEL_CUDA_INCLUDE_DIRS}
 )
 
 # =========================== Common SM90 Build ============================= #
@@ -373,13 +383,16 @@ else()
 endif()
 
 # mscclpp option
-set(MSCCLPP_USE_CUDA ON)
-set(MSCCLPP_BYPASS_GPU_CHECK ON)
-set(MSCCLPP_BUILD_TESTS OFF)
+set(MSCCLPP_USE_CUDA ON CACHE BOOL "Use NVIDIA/CUDA." FORCE)
+set(MSCCLPP_BYPASS_GPU_CHECK ON CACHE BOOL "Bypass GPU check." FORCE)
+set(MSCCLPP_BUILD_TESTS OFF CACHE BOOL "Build tests" FORCE)
+set(MSCCLPP_BUILD_PYTHON_BINDINGS OFF CACHE BOOL "Build Python bindings" FORCE)
+set(MSCCLPP_BUILD_APPS_NCCL OFF CACHE BOOL "Build NCCL interfaces" FORCE)
 add_subdirectory(
     ${repo-mscclpp_SOURCE_DIR}
     ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
 )
+target_include_directories(mscclpp_obj SYSTEM PRIVATE ${SGL_KERNEL_CUDA_INCLUDE_DIRS})
 
 target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
 target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
@@ -476,6 +489,7 @@ if (SGL_KERNEL_ENABLE_FA3)
         ${repo-cutlass_SOURCE_DIR}/include
         ${repo-cutlass_SOURCE_DIR}/tools/util/include
         ${repo-flash-attention_SOURCE_DIR}/hopper
+        ${SGL_KERNEL_CUDA_INCLUDE_DIRS}
     )
     target_link_libraries(flash_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
 
@@ -501,6 +515,7 @@ set(SPATIAL_SOURCES
 
 Python_add_library(spatial_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SPATIAL_SOURCES})
 target_compile_options(spatial_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
+target_include_directories(spatial_ops PRIVATE ${SGL_KERNEL_CUDA_INCLUDE_DIRS})
 target_link_libraries(spatial_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
 install(TARGETS spatial_ops LIBRARY DESTINATION sgl_kernel)
 

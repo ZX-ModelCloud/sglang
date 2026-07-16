@@ -78,10 +78,11 @@ RUNAI_STREAMER_TENSOR_ATTR = "_sglang_runai_streamer_tensor"
 
 # Matches routed-expert weight keys in both HF-style layouts
 # (``...mlp.experts.<N>.{gate,up,down}_proj.weight``) and DeepSeek V4
-# layouts (``...ffn.experts.<N>.w{1,2,3}.weight``). ``shared_experts`` is
-# excluded because the index segment requires a digit after ``.experts.``.
+# layouts (``...ffn.experts.<N>.w{1,2,3}.weight``). GPTQ checkpoints use
+# ``qweight`` instead. ``shared_experts`` is excluded because the index segment
+# requires a digit after ``.experts.``.
 _ROUTED_EXPERT_KEY_RE = re.compile(
-    r"\.experts\.\d+\.(?:w[123]|down_proj|up_proj|gate_proj)\.weight$"
+    r"\.experts\.\d+\.(?:w[123]|down_proj|up_proj|gate_proj)\.(?:qweight|weight)$"
 )
 
 
