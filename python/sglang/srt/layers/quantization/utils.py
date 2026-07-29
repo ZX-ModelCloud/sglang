@@ -5,9 +5,9 @@
 from __future__ import annotations
 
 import re
-from copy import deepcopy
+from copy import copy
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy
 import torch
@@ -274,25 +274,232 @@ def override_config(config: QuantizationConfig, prefix: str):
             )
 
 
+_REGEX_META_CHARACTERS = frozenset(r".^$*+?{}[]()|")
+
+
+def _get_literal_pattern(pattern: str) -> Optional[str]:
+    """Return the literal matched by an anchored regex, if possible."""
+    if not pattern.startswith("^") or not pattern.endswith("$"):
+        return None
+
+    literal = []
+    index = 1
+    end = len(pattern) - 1
+    while index < end:
+        character = pattern[index]
+        if character == "\\":
+            index += 1
+            if index >= end or pattern[index].isalnum():
+                return None
+            literal.append(pattern[index])
+        elif character in _REGEX_META_CHARACTERS:
+            return None
+        else:
+            literal.append(character)
+        index += 1
+    return "".join(literal)
+
+
+def _get_dynamic_rule_matcher(config: QuantizationConfig) -> Dict[str, Any]:
+    cache = getattr(config, "_dynamic_rule_matcher", None)
+    if (
+        cache is not None
+        and cache["dynamic"] is config.dynamic
+        and cache["size"] == len(config.dynamic)
+    ):
+        return cache
+
+    exact_rules = {}
+    regex_rules = []
+    for index, (pattern, pattern_dict) in enumerate(config.dynamic.items()):
+        # GPTQModel emits thousands of exact rules for mixed configurations.
+        is_negative = pattern.startswith("-:")
+        regex_pattern = pattern.removeprefix("-:").removeprefix("+:")
+        literal_pattern = _get_literal_pattern(regex_pattern)
+        if literal_pattern is not None:
+            exact_rules.setdefault(
+                literal_pattern,
+                (index, is_negative, pattern_dict),
+            )
+        else:
+            regex_rules.append(
+                (index, re.compile(regex_pattern), is_negative, pattern_dict)
+            )
+
+    cache = {
+        "dynamic": config.dynamic,
+        "size": len(config.dynamic),
+        "exact_rules": exact_rules,
+        "regex_rules": regex_rules,
+    }
+    config._dynamic_rule_matcher = cache
+    return cache
+
+
+def _find_dynamic_rule(
+    config: QuantizationConfig,
+    layer_name: str,
+) -> Tuple[bool, bool, Dict]:
+    matcher = _get_dynamic_rule_matcher(config)
+    exact_rule = matcher["exact_rules"].get(layer_name)
+    exact_rule_index = exact_rule[0] if exact_rule is not None else None
+
+    for index, pattern, is_negative, pattern_dict in matcher["regex_rules"]:
+        if exact_rule_index is not None and index > exact_rule_index:
+            break
+        if pattern.match(layer_name):
+            return True, is_negative, pattern_dict
+
+    if exact_rule is not None:
+        _, is_negative, pattern_dict = exact_rule
+        return True, is_negative, pattern_dict
+    return False, False, {}
+
+
+def _match_dynamic_override(
+    config: QuantizationConfig,
+    layer_name: str,
+    key: Optional[str],
+    default_value: Union[int, bool, None],
+) -> Tuple[bool, Union[Dict, int, bool, None]]:
+    matched, is_negative, pattern_dict = _find_dynamic_rule(config, layer_name)
+    if not matched:
+        return False, default_value
+    if is_negative:
+        return True, False
+    if key is None:
+        return True, pattern_dict
+    return True, pattern_dict.get(key, default_value)
+
+
+def _get_fused_shards(
+    layer_name: str,
+    fused_mapping: Mapping[str, List[str]],
+) -> Optional[Tuple[str, List[str]]]:
+    def is_module_suffix(module_name: str) -> bool:
+        suffix = module_name if module_name.startswith(".") else f".{module_name}"
+        return layer_name == module_name or layer_name.endswith(suffix)
+
+    fused_name = max(
+        (name for name in fused_mapping if is_module_suffix(name)),
+        key=len,
+        default=None,
+    )
+    if fused_name is None:
+        return None
+    return fused_name, fused_mapping[fused_name]
+
+
 def get_dynamic_override(
     config: QuantizationConfig,
     layer_name: str,
     key: Optional[str] = None,
     default_value: Union[int, bool, None] = None,
 ) -> Union[Dict, int, bool, None]:
-    for pattern, pattern_dict in config.dynamic.items():
-        # Negative match: matched modules are excluded from quantized init
-        if pattern.startswith("-:"):
-            if re.match(pattern.removeprefix("-:"), layer_name):
+    matched, value = _match_dynamic_override(config, layer_name, key, default_value)
+    if matched:
+        return value
+
+    fused_mapping = getattr(config, "packed_modules_mapping", {})
+    fused_shards = _get_fused_shards(layer_name, fused_mapping)
+    if fused_shards is None:
+        fused_shards = _get_fused_shards(layer_name, _FALLBACK_FUSED_SHARDS)
+    if fused_shards is None:
+        return default_value
+
+    # Checkpoint rules use the logical projection names, not the fused module.
+    fused_name, shard_proj_names = fused_shards
+    layer_prefix = layer_name.removesuffix(fused_name)
+    shard_matches = [
+        _match_dynamic_override(
+            config,
+            f"{layer_prefix}{shard_proj_name}",
+            key,
+            default_value,
+        )
+        for shard_proj_name in shard_proj_names
+    ]
+
+    if key is None:
+        negative_matches = [
+            shard_matched and shard_value is False
+            for shard_matched, shard_value in shard_matches
+        ]
+        if any(negative_matches):
+            if all(negative_matches):
                 return False
-        # Positive match: matched modules have quant properties overrides
-        # base quant config
-        elif re.match(pattern.removeprefix("+:"), layer_name):
-            if key is None:
-                return pattern_dict
-            else:
-                return pattern_dict.get(key, default_value)
-    return default_value
+            shard_values = {
+                name: value if shard_matched else default_value
+                for name, (shard_matched, value) in zip(shard_proj_names, shard_matches)
+            }
+            raise ValueError(
+                f"Dynamic quantization config for fused layer {layer_name} "
+                f"does not match across shards: {shard_values}"
+            )
+
+        for shard_matched, shard_value in shard_matches:
+            if shard_matched:
+                return shard_value
+        return default_value
+
+    shard_values = [
+        value if shard_matched else default_value
+        for shard_matched, value in shard_matches
+    ]
+    if any(value != shard_values[0] for value in shard_values[1:]):
+        values_by_shard = dict(zip(shard_proj_names, shard_values))
+        raise ValueError(
+            f"Dynamic quantization config for fused layer {layer_name} "
+            f"does not match across shards for {key}: {values_by_shard}"
+        )
+    return shard_values[0]
+
+
+def _flatten_quantized_layers(layers: List[Any]) -> List[str]:
+    flattened = []
+    for layer in layers:
+        if isinstance(layer, list):
+            flattened.extend(_flatten_quantized_layers(layer))
+        else:
+            flattened.append(layer)
+    return flattened
+
+
+def is_layer_gptq_quantized(
+    prefix: str,
+    quantized_layers: List[Any],
+    fused_mapping: Mapping[str, List[str]] = MappingProxyType({}),
+) -> bool:
+    """Check the checkpoint's physical GPTQ module list."""
+
+    def matches(module_name: str) -> bool:
+        return prefix == module_name or prefix.endswith(f".{module_name}")
+
+    quantized_layers = _flatten_quantized_layers(quantized_layers)
+    fused_shards = _get_fused_shards(prefix, fused_mapping)
+    if fused_shards is None:
+        fused_shards = _get_fused_shards(prefix, _FALLBACK_FUSED_SHARDS)
+    if fused_shards is None:
+        return any(matches(module_name) for module_name in quantized_layers)
+
+    fused_name, shard_names = fused_shards
+    layer_prefix = prefix.removesuffix(fused_name)
+    shard_quantized = []
+    for shard_name in shard_names:
+        shard_prefix = f"{layer_prefix}{shard_name}"
+        shard_quantized.append(
+            any(
+                shard_prefix == module_name or shard_prefix.endswith(f".{module_name}")
+                for module_name in quantized_layers
+            )
+        )
+
+    if any(shard_quantized) and not all(shard_quantized):
+        raise ValueError(
+            f"Detected some but not all shards of {prefix} are quantized. "
+            "All shards of a fused layer must use the same precision."
+        )
+    return all(shard_quantized)
 
 
 def get_linear_quant_method(
@@ -308,12 +515,25 @@ def get_linear_quant_method(
     )
     from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
-    cloned_config = deepcopy(config)
+    # Per-layer overrides only mutate scalar fields; rule tables are read-only.
+    cloned_config = copy(config)
+    if hasattr(config, "full_config"):
+        cloned_config.full_config = config.full_config.copy()
     parallel_lm_head_quantized = (
         isinstance(layer, ParallelLMHead) and cloned_config.lm_head_quantized
     )
 
     if isinstance(layer, LinearBase) or parallel_lm_head_quantized:
+        quantized_layers = getattr(cloned_config, "modules_in_block_to_quantize", None)
+        if quantized_layers is not None and not is_layer_gptq_quantized(
+            prefix,
+            quantized_layers,
+            getattr(cloned_config, "packed_modules_mapping", {}),
+        ):
+            if parallel_lm_head_quantized:
+                return UnquantizedEmbeddingMethod()
+            return UnquantizedLinearMethod()
+
         # False = skip module, None = no override, else = Positive match
         if get_dynamic_override(cloned_config, layer_name=prefix) is False:
             if parallel_lm_head_quantized:

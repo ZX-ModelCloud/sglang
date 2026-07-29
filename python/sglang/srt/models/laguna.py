@@ -175,20 +175,19 @@ class LagunaMoE(nn.Module):
             correction_bias=self.gate.e_score_correction_bias,
         )
 
-        # HF safetensors key is singular `shared_expert.…`; mirror so the
-        # default loader picks it up without remapping.
+        # Match the HF module and checkpoint prefix so dynamic rules also apply.
         # SGLANG_SHARED_EXPERT_TP1 replicates the shared expert instead of
         # TP-sharding it, for checkpoints whose shared-expert quant scales are
         # not divisible by the global TP size (e.g. block-FP8 [128,128] with
         # shared_expert_intermediate_size=512 at TP=8 → 64-per-rank shards).
         self._shared_expert_tp1 = envs.SGLANG_SHARED_EXPERT_TP1.get()
-        self.shared_expert = LagunaMLP(
+        self.shared_experts = LagunaMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.shared_expert_intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             reduce_results=False,
-            prefix=add_prefix("shared_expert", prefix),
+            prefix=add_prefix("shared_experts", prefix),
             **(dict(tp_rank=0, tp_size=1) if self._shared_expert_tp1 else {}),
         )
 
@@ -203,7 +202,7 @@ class LagunaMoE(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states
 
-        shared_out = self.shared_expert(hidden_states)
+        shared_out = self.shared_experts(hidden_states)
 
         router_logits = self.gate(hidden_states)
         if self.router_logit_softcapping > 0.0:

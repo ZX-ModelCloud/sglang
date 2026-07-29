@@ -75,6 +75,70 @@ logger = logging.getLogger(__name__)
 RUNAI_STREAMER_TENSOR_ATTR = "_sglang_runai_streamer_tensor"
 
 
+def _get_gptq_quantized_modules(
+    model_path: str,
+    revision: Optional[str] = None,
+    download_dir: Optional[str] = None,
+) -> Optional[List[str]]:
+    """Infer physically quantized GPTQ modules without loading tensor data."""
+    index_name = "model.safetensors.index.json"
+    index_path = os.path.join(model_path, index_name)
+
+    if not os.path.isdir(model_path):
+        try:
+            index_path = hf_hub_download(
+                repo_id=model_path,
+                filename=index_name,
+                revision=revision,
+                cache_dir=download_dir,
+                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+            )
+        except Exception:
+            return None
+
+    tensor_names = []
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            tensor_names = list(json.load(f).get("weight_map", {}))
+    elif os.path.isdir(model_path):
+        for weight_file in sorted(Path(model_path).glob("*.safetensors")):
+            with safetensors.safe_open(str(weight_file), framework="pt") as f:
+                tensor_names.extend(f.keys())
+
+    quantized_modules = sorted(
+        {
+            name.removesuffix(".qweight")
+            for name in tensor_names
+            if name.endswith(".qweight")
+        }
+    )
+    return quantized_modules or None
+
+
+def _maybe_set_gptq_quantized_modules(
+    config: Dict[str, Any],
+    model_config: ModelConfig,
+    load_config: LoadConfig,
+) -> None:
+    if model_config.quantization not in {"gptq", "gptq_marlin"}:
+        return
+    if config.get("modules_in_block_to_quantize"):
+        return
+
+    modules = _get_gptq_quantized_modules(
+        model_config.model_path,
+        revision=model_config.revision,
+        download_dir=load_config.download_dir,
+    )
+    if modules is not None:
+        # The checkpoint is authoritative when dynamic rules include BF16 layers.
+        config["modules_in_block_to_quantize"] = modules
+        logger.info(
+            "Detected %d physically quantized GPTQ modules from safetensors.",
+            len(modules),
+        )
+
+
 # Matches routed-expert weight keys in both HF-style layouts
 # (``...mlp.experts.<N>.{gate,up,down}_proj.weight``) and DeepSeek V4
 # layouts (``...ffn.experts.<N>.w{1,2,3}.weight``). ``shared_experts`` is
@@ -277,6 +341,9 @@ def get_quant_config(
         if not modelopt_mixed_config_incomplete:
             hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
             hf_quant_config["hf_config"] = model_config.hf_config
+            _maybe_set_gptq_quantized_modules(
+                hf_quant_config, model_config, load_config
+            )
 
             # This is only used by quantization methods that support requantization (e.g. from fp8 to mxfp4).
             if model_config.quantization in REQUANTIZATION_METHODS:
@@ -349,6 +416,7 @@ def get_quant_config(
             ]
             config["quantization"]["exclude_modules"] = exclude_modules
         config["packed_modules_mapping"] = packed_modules_mapping
+        _maybe_set_gptq_quantized_modules(config, model_config, load_config)
 
         if model_config.quantization == "bitsandbytes":
             config["adapter_name_or_path"] = model_name_or_path

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+from copy import copy
+from dataclasses import dataclass
 from fractions import Fraction
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
@@ -15,6 +17,7 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.marlin_utils import check_marlin_supported
 from sglang.srt.layers.quantization.utils import (
+    get_dynamic_override,
     get_linear_quant_method,
     get_scalar_types,
 )
@@ -48,6 +51,167 @@ def check_marlin_format(hf_quant_cfg: Dict[str, Any]) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class _GPTQQuantConfigValues:
+    weight_bits: int
+    group_size: int
+    desc_act: bool
+    is_sym: bool
+
+
+def _apply_dynamic_override(
+    values: _GPTQQuantConfigValues,
+    override: Optional[Dict[str, Union[int, bool]]],
+) -> _GPTQQuantConfigValues:
+    if override is None:
+        return values
+    return _GPTQQuantConfigValues(
+        weight_bits=int(override.get("bits", values.weight_bits)),
+        group_size=int(override.get("group_size", values.group_size)),
+        desc_act=bool(override.get("desc_act", values.desc_act)),
+        is_sym=bool(override.get("sym", values.is_sym)),
+    )
+
+
+def _clone_marlin_config(
+    config: GPTQMarlinConfig,
+    values: _GPTQQuantConfigValues,
+) -> GPTQMarlinConfig:
+    quant_type = config.TYPE_MAP.get((values.weight_bits, values.is_sym))
+    if quant_type is None:
+        raise ValueError(
+            "Unsupported quantization config: "
+            f"bits={values.weight_bits}, sym={values.is_sym}"
+        )
+
+    cloned_config = copy(config)
+    cloned_config.full_config = config.full_config.copy()
+    cloned_config.weight_bits = values.weight_bits
+    cloned_config.group_size = values.group_size
+    cloned_config.desc_act = values.desc_act
+    cloned_config.is_sym = values.is_sym
+    cloned_config.pack_factor = 32 // values.weight_bits
+    cloned_config.quant_type = quant_type
+    cloned_config.full_config.update(
+        {
+            "bits": values.weight_bits,
+            "group_size": values.group_size,
+            "desc_act": values.desc_act,
+            "sym": values.is_sym,
+        }
+    )
+    return cloned_config
+
+
+def _resolve_moe_quant_config(
+    config: GPTQMarlinConfig,
+    layer: torch.nn.Module,
+    prefix: str,
+) -> tuple[Optional[GPTQMarlinConfig], Dict[tuple[int, str], int]]:
+    """Resolve one losslessly representable GPTQ scheme for a fused MoE."""
+    base_values = _GPTQQuantConfigValues(
+        weight_bits=config.weight_bits,
+        group_size=config.group_size,
+        desc_act=config.desc_act,
+        is_sym=config.is_sym,
+    )
+
+    layer_override = get_dynamic_override(config, layer_name=prefix)
+    if layer_override is False:
+        return None, {}
+    assert layer_override is None or isinstance(layer_override, dict)
+    layer_values = _apply_dynamic_override(base_values, layer_override)
+
+    shard_projections = {
+        "w1": getattr(layer, "ckpt_gate_proj_name", "gate_proj"),
+        "w2": getattr(layer, "ckpt_down_proj_name", "down_proj"),
+        "w3": getattr(layer, "ckpt_up_proj_name", "up_proj"),
+    }
+    num_checkpoint_experts = layer.num_global_routed_experts
+    shard_values = {}
+    for expert_id in range(num_checkpoint_experts):
+        for shard_id, projection_name in shard_projections.items():
+            shard_prefix = f"{prefix}.{expert_id}.{projection_name}"
+            dynamic_override = get_dynamic_override(config, layer_name=shard_prefix)
+            if dynamic_override is False:
+                shard_values[(expert_id, shard_id)] = None
+                continue
+            assert dynamic_override is None or isinstance(dynamic_override, dict)
+            shard_values[(expert_id, shard_id)] = _apply_dynamic_override(
+                layer_values, dynamic_override
+            )
+
+    quantized_values = [value for value in shard_values.values() if value is not None]
+    if not quantized_values:
+        return None, {}
+    if len(quantized_values) != len(shard_values):
+        skipped_shards = [
+            f"expert {expert_id} {shard_id}"
+            for (expert_id, shard_id), value in shard_values.items()
+            if value is None
+        ]
+        raise ValueError(
+            f"GPTQ FusedMoE layer '{prefix}' excludes only some expert "
+            f"shards from quantization: {skipped_shards}"
+        )
+
+    def get_uniform_value(name: str) -> Union[int, bool]:
+        values = {getattr(value, name) for value in quantized_values}
+        if len(values) != 1:
+            raise ValueError(
+                f"GPTQ FusedMoE layer '{prefix}' has mixed {name}: "
+                f"{sorted(values)}. Only group_size may differ between experts."
+            )
+        return next(iter(values))
+
+    weight_bits = int(get_uniform_value("weight_bits"))
+    desc_act = bool(get_uniform_value("desc_act"))
+    is_sym = bool(get_uniform_value("is_sym"))
+    source_group_sizes = {
+        shard: value.group_size
+        for shard, value in shard_values.items()
+        if value is not None
+    }
+    unique_group_sizes = set(source_group_sizes.values())
+
+    if len(unique_group_sizes) == 1:
+        group_size = next(iter(unique_group_sizes))
+    else:
+        if desc_act:
+            raise ValueError(
+                f"GPTQ FusedMoE layer '{prefix}' has mixed group_size "
+                f"{sorted(unique_group_sizes)} with desc_act=True, which cannot "
+                "be normalized losslessly."
+            )
+        if any(group_size <= 0 for group_size in unique_group_sizes):
+            raise ValueError(
+                f"GPTQ FusedMoE layer '{prefix}' cannot mix channelwise and "
+                f"group quantization: {sorted(unique_group_sizes)}"
+            )
+        group_size = min(unique_group_sizes)
+        if any(
+            source_group_size % group_size for source_group_size in unique_group_sizes
+        ):
+            raise ValueError(
+                f"GPTQ FusedMoE layer '{prefix}' has incompatible group "
+                f"sizes: {sorted(unique_group_sizes)}"
+            )
+        logger.info_once(
+            "GPTQ FusedMoE checkpoint uses mixed group sizes %s; "
+            "normalizing quantization metadata to group_size=%d.",
+            tuple(sorted(unique_group_sizes)),
+            group_size,
+        )
+
+    resolved_values = _GPTQQuantConfigValues(
+        weight_bits=weight_bits,
+        group_size=group_size,
+        desc_act=desc_act,
+        is_sym=is_sym,
+    )
+    return _clone_marlin_config(config, resolved_values), source_group_sizes
+
+
 class GPTQConfig(QuantizationConfig):
     """Config class for GPTQ.
 
@@ -64,6 +228,7 @@ class GPTQConfig(QuantizationConfig):
         checkpoint_format: str = "",
         true_sequential: bool = False,
         static_groups: bool = False,
+        modules_in_block_to_quantize: Optional[List[Any]] = None,
     ) -> None:
         # GPTQModel use `dynamic` config property to allow per module
         # quantization config so each module can be individually optimized.
@@ -102,6 +267,7 @@ class GPTQConfig(QuantizationConfig):
         self.checkpoint_format = checkpoint_format
         self.true_sequential = true_sequential
         self.static_groups = static_groups
+        self.modules_in_block_to_quantize = modules_in_block_to_quantize
         if self.weight_bits not in [2, 3, 4, 8]:
             raise ValueError(
                 "Currently, only 2/3/4/8-bit weight quantization is "
@@ -158,7 +324,10 @@ class GPTQConfig(QuantizationConfig):
             config, ["true_sequential"], default=False
         )
         static_groups = cls.get_from_keys_or(config, ["static_groups"], default=False)
-        return cls(
+        modules_in_block_to_quantize = cls.get_from_keys_or(
+            config, ["modules_in_block_to_quantize"], default=None
+        )
+        quant_config = cls(
             weight_bits,
             group_size,
             desc_act,
@@ -167,7 +336,12 @@ class GPTQConfig(QuantizationConfig):
             checkpoint_format,
             true_sequential,
             static_groups,
+            modules_in_block_to_quantize,
         )
+        quant_config.update_packed_modules_mapping(
+            config.get("packed_modules_mapping", {})
+        )
+        return quant_config
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -279,6 +453,7 @@ class GPTQMarlinConfig(QuantizationConfig):
         lm_head_quantized: bool,
         dynamic: Dict[str, Dict[str, Union[int, bool]]],
         full_config: Dict[str, Any],
+        modules_in_block_to_quantize: Optional[List[Any]] = None,
     ) -> None:
         super().__init__()
         if desc_act and group_size == -1:
@@ -319,6 +494,7 @@ class GPTQMarlinConfig(QuantizationConfig):
         self.desc_act = desc_act
         self.lm_head_quantized = lm_head_quantized
         self.full_config = full_config
+        self.modules_in_block_to_quantize = modules_in_block_to_quantize
 
         if (weight_bits, is_sym) not in self.TYPE_MAP:
             raise ValueError(
@@ -370,7 +546,10 @@ class GPTQMarlinConfig(QuantizationConfig):
         desc_act = cls.get_from_keys(config, ["desc_act"])
         is_sym = cls.get_from_keys(config, ["sym"])
         lm_head_quantized = cls.get_from_keys_or(config, ["lm_head"], default=False)
-        return cls(
+        modules_in_block_to_quantize = cls.get_from_keys_or(
+            config, ["modules_in_block_to_quantize"], default=None
+        )
+        quant_config = cls(
             weight_bits,
             group_size,
             desc_act,
@@ -378,7 +557,12 @@ class GPTQMarlinConfig(QuantizationConfig):
             lm_head_quantized,
             dynamic,
             config,
+            modules_in_block_to_quantize,
         )
+        quant_config.update_packed_modules_mapping(
+            config.get("packed_modules_mapping", {})
+        )
+        return quant_config
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
@@ -414,7 +598,16 @@ class GPTQMarlinConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
-            return GPTQMarlinMoEMethod(self)
+            resolved_config, source_group_sizes = _resolve_moe_quant_config(
+                self, layer, prefix
+            )
+            if resolved_config is None:
+                return None
+            has_mixed_group_sizes = len(set(source_group_sizes.values())) > 1
+            return GPTQMarlinMoEMethod(
+                resolved_config,
+                source_group_sizes if has_mixed_group_sizes else None,
+            )
         return get_linear_quant_method(
             self, layer, prefix=prefix, linear_method_cls=GPTQMarlinLinearMethod
         )
@@ -591,8 +784,86 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
 class GPTQMarlinMoEMethod(FusedMoEMethodBase):
     """MoE Marlin method with quantization."""
 
-    def __init__(self, quant_config: GPTQMarlinConfig) -> None:
+    def __init__(
+        self,
+        quant_config: GPTQMarlinConfig,
+        source_group_sizes: Optional[Dict[tuple[int, str], int]] = None,
+    ) -> None:
         self.quant_config = quant_config
+        self.source_group_sizes = source_group_sizes or {}
+
+    def _normalize_group_metadata(
+        self,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+    ) -> torch.Tensor:
+        if not weight_name.endswith(("scales", "qzeros", "g_idx")):
+            return loaded_weight
+
+        source_group_size = self.source_group_sizes.get((expert_id, shard_id))
+        if source_group_size is None:
+            raise ValueError(
+                "Missing source group_size for GPTQ FusedMoE "
+                f"expert {expert_id} shard {shard_id}."
+            )
+
+        target_group_size = self.quant_config.group_size
+        if source_group_size == target_group_size:
+            return loaded_weight
+        if (
+            source_group_size <= 0
+            or target_group_size <= 0
+            or source_group_size % target_group_size
+        ):
+            raise ValueError(
+                "Cannot normalize GPTQ FusedMoE group_size "
+                f"{source_group_size} to {target_group_size} for expert "
+                f"{expert_id} shard {shard_id}."
+            )
+
+        repeat_factor = source_group_size // target_group_size
+        # Repeated metadata describes the same dequantized qweight values.
+        if weight_name.endswith(("scales", "qzeros")):
+            return loaded_weight.repeat_interleave(repeat_factor, dim=0)
+
+        positions = torch.arange(
+            loaded_weight.numel(),
+            dtype=loaded_weight.dtype,
+            device=loaded_weight.device,
+        )
+        expected_g_idx = (positions // source_group_size).reshape_as(loaded_weight)
+        if not torch.equal(loaded_weight, expected_g_idx):
+            raise ValueError(
+                "Cannot normalize non-sequential g_idx for mixed-group "
+                f"GPTQ FusedMoE expert {expert_id} shard {shard_id}."
+            )
+        return (positions // target_group_size).reshape_as(loaded_weight)
+
+    def _wrap_weight_loader(self, weight_loader):
+        def mixed_group_weight_loader(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            weight_name: str,
+            shard_id: str,
+            expert_id: int,
+        ) -> None:
+            loaded_weight = self._normalize_group_metadata(
+                loaded_weight,
+                weight_name,
+                shard_id,
+                expert_id,
+            )
+            weight_loader(
+                param,
+                loaded_weight,
+                weight_name,
+                shard_id,
+                expert_id,
+            )
+
+        return mixed_group_weight_loader
 
     def create_weights(
         self,
@@ -603,6 +874,10 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        if self.source_group_sizes:
+            extra_weight_attrs["weight_loader"] = self._wrap_weight_loader(
+                extra_weight_attrs["weight_loader"]
+            )
         if not hasattr(layer, "scheme"):
             layer.scheme = self.quant_config.get_moe_scheme(layer)
         layer.scheme.create_weights(

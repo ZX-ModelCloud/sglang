@@ -226,6 +226,9 @@ class FusedMoE(torch.nn.Module):
         routing_method_type: Optional[RoutingMethodType] = None,
         is_gated: bool = True,
         gate_up_interleaved: bool = True,
+        ckpt_gate_proj_name: str = "gate_proj",
+        ckpt_down_proj_name: str = "down_proj",
+        ckpt_up_proj_name: str = "up_proj",
     ):
         super().__init__()
         if params_dtype is None:
@@ -239,6 +242,9 @@ class FusedMoE(torch.nn.Module):
         self.num_experts = num_experts
         self.with_bias = with_bias
         self.num_fused_shared_experts = num_fused_shared_experts
+        self.ckpt_gate_proj_name = ckpt_gate_proj_name
+        self.ckpt_down_proj_name = ckpt_down_proj_name
+        self.ckpt_up_proj_name = ckpt_up_proj_name
 
         self.enable_flashinfer_cutlass_moe = (
             get_moe_runner_backend().is_flashinfer_cutlass()
